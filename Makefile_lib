@@ -1,0 +1,13 @@
+CC     = gcc
+CFLAGS = -Wall -g
+
+all: libksocket.a
+
+ksocket.o: ksocket.c ksocket.h
+	$(CC) $(CFLAGS) -c ksocket.c -o ksocket.o
+
+libksocket.a: ksocket.o
+	ar rcs libksocket.a ksocket.o
+
+clean:
+	rm -f ksocket.o libksocket.a

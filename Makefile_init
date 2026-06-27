@@ -1,0 +1,10 @@
+CC     = gcc
+CFLAGS = -Wall -g
+
+all: initksocket
+
+initksocket: initksocket.c ksocket.h
+	$(CC) $(CFLAGS) initksocket.c -o initksocket -lpthread
+
+clean:
+	rm -f initksocket

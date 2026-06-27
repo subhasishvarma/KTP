@@ -1,0 +1,322 @@
+Mini Project 1 Submission
+Group Details :
+Member 1 Name : M Subhasish Varma
+Member 1 Roll number : 23CS30034
+Member 2 Name : K Abhiram
+Member 2 Roll number : 23CS10036
+
+1: TRANSMISSION STATISTICS TABLE
+
+Test file size : > 100 KB
+Message size   : 512 bytes (fixed, per protocol)
+Timeout (T)    : 5 seconds
+Window size    : 10 messages (send buffer = receive buffer = 10 slots)
+
+For each value of p, the same file was transferred from user1 to user2.
+"Messages generated" = number of 512-byte chunks + 1 EOF marker.
+"Total transmissions" = every sendto() call by Thread S, including retransmits.
+"Avg Tx/Msg" = Total transmissions / Messages generated.
+
++-------+---------------------+--------------------+--------------+
+|   p   | Messages Generated  | Total Transmissions| Avg Tx / Msg |
++-------+---------------------+--------------------+--------------+
+| 0.05  |        197          |        218         |    1.107     |
+| 0.10  |        197          |        234         |    1.188     |
+| 0.15  |        197          |        286         |    1.452     |
+| 0.20  |        197          |        360         |    1.827     |
+| 0.25  |        197          |        386         |    1.959     |
+| 0.30  |        197          |        505         |    2.563     |
+| 0.35  |        197          |        568         |    2.883     |
+| 0.40  |        197          |        622         |    3.157     |
+| 0.45  |        197          |        683         |    3.467     |
+| 0.50  |        197          |        707         |    3.589     |
++-------+---------------------+--------------------+--------------+
+
+Observation:
+  As p increases from 0.05 to 0.50, the average number of transmissions
+  per message generally increases. At low p (0.05), very few packets are
+  dropped so each message needs only ~1.1 transmissions on average. At
+  p=0.50 (50% loss), ~3.59 transmissions per message are needed.
+
+How to reproduce:
+  1. Edit ksocket.h: set DROP_PROB to the desired p value (e.g. 0.10f).
+  2. Run: make clean && make
+  3. Terminal 1: ./initksocket
+  4. Terminal 2: ./user2 127.0.0.1 8081 127.0.0.1 8080 output.txt
+  5. Terminal 3: ./user1 127.0.0.1 8080 127.0.0.1 8081 input.txt
+  6. Read the "TRANSMISSION STATISTICS" block printed by user1 on exit.
+  7. Repeat for each p value.
+
+
+2: DATA STRUCTURES
+
+2.1  KTPHeader  (defined in ksocket.h)
+Wire-format header prepended to every UDP datagram sent between peers.
+
+  char     pkt_type  -- Packet type: 'D' for data, 'A' for acknowledgement.
+  uint8_t  seq       -- 8-bit sequence number. Wraps naturally at 256.
+                        Sequence numbers always start at 1.
+  int      rwnd_sz   -- Piggybacked receiver window size. Only meaningful
+                        in ACK packets; set to 0 in data packets. Tells
+                        the sender how many more messages the receiver can
+                        currently accept.
+  uint16_t msg_len   -- Actual content length (bytes) of the payload.
+                        Allows the receiver to recover the true message
+                        size from a fixed-size 512-byte slot without
+                        relying on null-termination heuristics.
+
+2.2  SenderWindow  (defined in ksocket.h)
+Per-socket book-keeping for the sender side of the sliding window.
+
+  uint8_t  base_seq  -- Sequence number of the oldest UN-acknowledged
+                        message. Advances when ACKs arrive.
+  uint8_t  next_seq  -- Sequence number to assign to the next outgoing
+                        transmission. On timeout, reset to base_seq to
+                        retransmit the entire window (go-back-N).
+  int      win_size  -- Current usable window size, updated from the
+                        rwnd_sz field of each incoming ACK. Limits how
+                        many unACKed messages may be in flight at once.
+
+2.3  ReceiverWindow  (defined in ksocket.h)
+Per-socket book-keeping for the receiver side of the sliding window.
+
+  uint8_t  expected_seq -- The next sequence number the receiver is
+                           waiting for. In-order arrivals advance this
+                           field; out-of-order arrivals do not.
+
+2.4  KTPSocket  (defined in ksocket.h)
+One entry in the shared-memory table SM[MAX_SOCKETS]. Each entry fully
+describes one KTP socket and is accessed concurrently by the user process
+(via k_sendto / k_recvfrom) and by Threads R, S, GC inside initksocket.
+Every field access must be protected by the per-slot mutex lock.
+
+  Slot bookkeeping
+  ----------------
+  bool     is_free    -- true = slot available for k_socket(); false = in use.
+  pid_t    owner_pid  -- PID of the process that called k_socket(). The GC
+                         thread uses kill(pid, 0) to detect dead owners.
+  int      udp_fd     -- File descriptor of the underlying UDP socket,
+                         created and owned by Thread R. Set to -1 while a
+                         k_bind() request is pending.
+  uint16_t local_port -- UDP port this socket is bound to (host-byte-order).
+                         Written by k_bind(); Thread R creates the UDP
+                         socket once this is non-zero. Reset to 0 on failure.
+  char     peer_ip[]  -- Null-terminated dotted-decimal string of the peer.
+  int      peer_port  -- Remote UDP port (host-byte-order).
+  time_t   close_ts   -- Unix timestamp set by k_close() when the user
+                         releases the slot. Thread R implements a TIME_WAIT
+                         linger of 2*T seconds so it can re-ACK any
+                         retransmit of the last packet whose ACK was lost.
+                         Value 0 means the socket is not in TIME_WAIT.
+
+  Send side
+  ---------
+  char         sbuf[10][512]     -- Circular send buffer; 10 fixed-size slots.
+  size_t       sbuf_msg_len[10]  -- Actual content length of each send slot.
+                                    Copied into KTPHeader.msg_len on transmit
+                                    so the receiver knows the exact payload size.
+  int          sbuf_write        -- Index of the next slot k_sendto() writes.
+  int          sbuf_count        -- Number of messages in the buffer (queued
+                                    or in-flight but not yet ACKed).
+  int          total_transmissions -- Running count of every sendto() call
+                                    made by Thread S for this socket, including
+                                    retransmissions. Used to compute the average
+                                    transmissions per message for the report.
+  SenderWindow swnd              -- Sender window state (see 2.2).
+  time_t       last_sent_ts      -- Timestamp when the oldest in-flight message
+                                    was last transmitted. Used by Thread S to
+                                    detect retransmission timeouts.
+
+  Receive side
+  ------------
+  char           rbuf[10][512]     -- Circular receive buffer; 10 slots.
+  size_t         rbuf_msg_len[10]  -- Actual content length of each recv slot,
+                                      extracted from KTPHeader.msg_len on arrival.
+                                      Used by k_recvfrom() to return the exact
+                                      number of bytes written by the sender.
+  bool           rbuf_valid[10]    -- rbuf_valid[i] true = slot i holds an
+                                      unread message (possibly out-of-order).
+  int            rbuf_in           -- Slot index where Thread R places the next
+                                      in-order message. Slides forward as the
+                                      window advances.
+  int            rbuf_out          -- Slot index where the user application reads
+                                      next. Advances each k_recvfrom() call.
+  int            rbuf_ready        -- Count of contiguous in-order messages
+                                      immediately available to the application.
+  int            rbuf_total        -- Total messages buffered, including
+                                      out-of-order ones. Used to compute the
+                                      remaining receive window.
+  bool           nospace           -- True when rbuf_total == 10 (buffer full).
+                                      Thread R sends periodic beacon ACKs while
+                                      this is set so the sender does not deadlock.
+                                      Cleared only when new data arrives.
+  ReceiverWindow rwnd              -- Receiver window state (see 2.3).
+
+  Synchronisation
+  ---------------
+  pthread_mutex_t lock -- PTHREAD_PROCESS_SHARED mutex. Must be held for
+                          any read or write of any field in this structure.
+
+
+SECTION 3: FUNCTIONS IN ksocket.c
+
+attach_shm()  [static, internal]
+Attaches the calling process to the shared-memory segment created by
+initksocket. Idempotent -- does nothing if SM is already set. Called
+automatically at the start of every public API function.
+Returns 0 on success, -1 if the segment cannot be found or attached
+(usually means initksocket is not running).
+
+k_socket(domain, type, protocol)
+Scans SM[0..MAX_SOCKETS-1] for the first free slot, claims it, zeroes
+all fields, and initialises the send/receive windows (sequence numbers
+start at 1, window size = 10). Returns the slot index as the KTP socket
+descriptor on success. Returns -1 with my_errno = ENOSPACE if no free
+slot is available, or if type != SOCK_KTP.
+
+k_bind(kfd, src, src_len, dst, dst_len)
+Records the local port (from src) and the peer IP and port (from dst)
+into SM[kfd]. Then blocks in a polling loop (10 ms sleep per iteration)
+waiting for Thread R inside initksocket to create and bind the underlying
+UDP socket. Returns 0 once udp_fd >= 0 (success). Returns -1 if Thread R
+signals a failure (port in use, socket() error), detected by local_port
+being zeroed back to 0.
+
+k_sendto(kfd, msg, len, flags, dst, dst_len)
+Verifies that the destination (dst) matches the peer address recorded by
+k_bind(). Copies up to MAX_MSG_SIZE bytes from msg into the next free slot
+of the circular send buffer (sbuf), records the actual length in
+sbuf_msg_len[], advances sbuf_write, and increments sbuf_count. Thread S
+will autonomously pick up and transmit the message.
+Returns the number of bytes buffered on success.
+Returns -1 with my_errno = ENOTBOUND if the destination does not match.
+Returns -1 with my_errno = ENOSPACE if sbuf_count >= 10 (buffer full;
+caller must retry after a short sleep).
+
+k_recvfrom(kfd, buf, len, flags, src, src_len)
+Checks whether rbuf_ready > 0 (at least one in-order message is available).
+If so, copies rbuf_msg_len[rbuf_out] bytes from rbuf[rbuf_out] into buf,
+releases the slot (clears rbuf_valid, zeroes rbuf_msg_len), advances
+rbuf_out, decrements rbuf_ready and rbuf_total. Optionally fills src with
+the peer address.
+Returns the number of bytes copied on success.
+Returns -1 with my_errno = ENOMESSAGE if no message is available (caller
+must retry after a short sleep).
+
+k_close(kfd)
+Graceful shutdown in two phases:
+  Phase 1 -- Drain: polls sbuf_count every 50 ms until it reaches zero,
+  printing a "still in flight" warning at most once per T seconds if the
+  wait is long.
+  Phase 2 -- TIME_WAIT: sets close_ts = time(NULL) and owner_pid = 0.
+  Thread R keeps the UDP socket alive for 2*T seconds so it can re-ACK
+  any retransmit of the last packet whose ACK was lost. After 2*T seconds
+  Thread R closes udp_fd and sets is_free = true.
+Returns 0 on success, -1 on invalid kfd.
+
+dropMessage(p)
+Simulates an unreliable network link. Generates a uniform random float
+in [0, 1). Returns 1 (drop the packet) if the random value < p, else 0.
+Called in Thread R of initksocket after every recvfrom(), before any
+processing. A return value of 1 means the packet is silently discarded,
+simulating network loss.
+
+
+SECTION 4: FUNCTIONS IN initksocket.c
+
+handle_signal(sig)  [static]
+Signal handler registered for SIGINT and SIGTERM. Detaches from shared
+memory (shmdt), removes the segment (shmctl IPC_RMID), and exits cleanly.
+Ensures the shared memory segment is not leaked if the daemon is killed.
+
+dropMessage(p)  [local copy]
+Identical to the version in ksocket.c. A separate copy is needed because
+initksocket is compiled standalone (without linking libksocket.a) to avoid
+the "multiple definition of SM" linker error.
+
+thread_R(arg)
+The receive handler thread. Runs an infinite loop with four stages:
+
+  Step 1 -- TIME_WAIT cleanup:
+    For every slot where close_ts > 0 and 2*T seconds have elapsed since
+    close_ts, closes udp_fd, zeroes local_port and peer fields, and sets
+    is_free = true. This implements the TIME_WAIT linger period.
+
+  Step 2 -- Pending bind requests:
+    For every slot that is not free, has udp_fd == -1, has local_port != 0,
+    and is not in TIME_WAIT (close_ts == 0): calls socket() + bind() to
+    create the underlying UDP socket. On success sets udp_fd. On failure
+    signals k_bind() by zeroing local_port and setting is_free = true.
+
+  Step 3 -- select():
+    Builds a read-set containing all active and TIME_WAIT UDP sockets.
+    Calls select() with a timeout of T seconds.
+
+  Timeout path:
+    For every active socket with nospace = true and free receive slots,
+    sends a duplicate ACK (beacon ACK) piggybacking the current free
+    slot count. This prevents the sender from deadlocking when the last
+    rwnd=0 ACK was lost. The nospace flag is NOT cleared here because
+    clearing it before the sender responds could cause permanent deadlock
+    if the beacon itself is also lost.
+
+  Data path ('D' packet):
+    Calls dropMessage(DROP_PROB) first; if dropped, skips all processing.
+    Computes the offset of the arriving sequence number from expected_seq
+    using 8-bit unsigned arithmetic (handles wraparound automatically).
+    If within the receive window and not a duplicate, copies the payload
+    into rbuf at the correct circular slot, stores rbuf_msg_len from
+    hdr->msg_len. If in-order (offset == 0), slides rbuf_in forward past
+    all contiguous valid slots and increments rbuf_ready for each. Sends
+    a cumulative ACK for the highest contiguous sequence received,
+    piggybacking the current free slot count as rwnd. If out-of-order,
+    buffers without ACKing. Old duplicates (offset > 128 in 8-bit wrap)
+    are re-ACKed to stop unnecessary sender retransmissions.
+
+  ACK path ('A' packet):
+    Calls dropMessage(DROP_PROB) first. Computes offset of acked seq from
+    swnd.base_seq. If advancing (offset < sbuf_count), dequeues (offset+1)
+    messages from the send buffer, advances swnd.base_seq, updates
+    swnd.win_size from hdr->rwnd_sz. If duplicate (offset >= sbuf_count),
+    only updates swnd.win_size (handles window-update beacon ACKs from
+    the receiver).
+
+thread_S(arg)
+The sender thread. Wakes every T/2 seconds and scans all active sockets
+(skipping free slots and TIME_WAIT slots):
+
+  Timeout detection:
+    Computes in_flight = next_seq - base_seq. If in_flight > 0 and
+    time(NULL) - last_sent_ts >= T, a retransmission timeout has occurred.
+    Resets next_seq = base_seq to retransmit the entire unACKed window
+    (go-back-N retransmission policy).
+
+  Transmission:
+    Computes oldest_slot = (sbuf_write - sbuf_count + 10) % 10.
+    While offset (= next_seq - base_seq) < sbuf_count AND < swnd.win_size:
+      Builds a KTPHeader with pkt_type='D', seq=next_seq, rwnd_sz=0, and
+      msg_len from sbuf_msg_len[slot]. Copies the header and the full
+      512-byte slot payload into a packet buffer. Calls sendto() on udp_fd.
+      Increments total_transmissions. Advances next_seq. Resets
+      last_sent_ts only for offset==0 (oldest unACKed message).
+
+thread_GC(arg)
+The garbage collector thread. Wakes every 10 seconds. For every slot that
+is not free and has a non-zero owner_pid, calls kill(owner_pid, 0). If
+this returns -1 (process no longer exists), the slot owner has died
+without calling k_close(). The GC closes udp_fd, sets is_free = true, and
+zeroes local_port and owner_pid to reclaim the slot for future use.
+
+main()
+  1. Registers SIGINT and SIGTERM handlers (handle_signal).
+  2. Calls ftok(FTOK_PATH, FTOK_ID) to generate a unique shared memory key.
+  3. Creates the shared memory segment with IPC_CREAT | IPC_EXCL. If it
+     already exists (EEXIST), removes the stale segment with IPC_RMID and
+     recreates it fresh.
+  4. Attaches to the segment with shmat().
+  5. Initialises all MAX_SOCKETS slots: is_free=true, udp_fd=-1,
+     local_port=0, close_ts=0, total_transmissions=0, all length arrays
+     zeroed, all rbuf_valid flags false, process-shared mutex initialised.
+  6. Launches threads R, S, and GC with pthread_create().
+  7. Joins all three threads (blocks forever in normal operation).
+  8. On return (only if threads exit), detaches and removes shared memory.
